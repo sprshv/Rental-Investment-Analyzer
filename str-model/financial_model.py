@@ -1,9 +1,92 @@
 """
-Rental Investment Model — Phase 1
+Rental Investment Model — Phase 1 + Phase 2
 Supports: Short-Term Rental (STR) and Long-Term Rental (LTR)
 Markets: Indianapolis, Los Angeles, Las Vegas
+Revenue data: AirROI market summary (Phase 2)
+              Plug in ML model prediction via custom_adr/custom_occupancy (future)
 Usage: python financial_model.py
 """
+
+import os
+import pandas as pd
+
+# ── Market data loader ────────────────────────────────────────────────────────
+# Loads real ADR, occupancy, and monthly revenue from AirROI processed data.
+# Falls back to hardcoded estimates if processed data not found.
+
+PROCESSED_DIR = "data/processed"
+
+def load_market_data():
+    """
+    Load AirROI market summary and seasonality into memory.
+    Returns (summary_lookup, seasonality_lookup) or (None, None) if not found.
+    """
+    summary_path    = os.path.join(PROCESSED_DIR, "market_summary.csv")
+    seasonality_path= os.path.join(PROCESSED_DIR, "seasonality.csv")
+
+    if not os.path.exists(summary_path):
+        return None, None
+
+    summary_df = pd.read_csv(summary_path)
+    seas_df    = pd.read_csv(seasonality_path) if os.path.exists(seasonality_path) else None
+
+    # Build summary lookup: (market, bedrooms) → stats
+    summary_lookup = {}
+    for _, row in summary_df.iterrows():
+        key = (row["market"], int(row["bedrooms"]))
+        summary_lookup[key] = {
+            "median_adr":             row.get("median_adr", None),
+            "median_occupancy":       row.get("median_occupancy", None),
+            "median_monthly_revenue": row.get("median_monthly_revenue", None),
+            "median_annual_revenue":  row.get("median_annual_revenue", None),
+            "p25_monthly":            row.get("p25_monthly", None),
+            "p75_monthly":            row.get("p75_monthly", None),
+            "p25_revenue":            row.get("p25_revenue", None),
+            "p75_revenue":            row.get("p75_revenue", None),
+            "sample_size":            row.get("sample_size", 0),
+        }
+
+    # Build seasonality lookup: market → month → indices
+    seasonality_lookup = {}
+    if seas_df is not None:
+        for _, row in seas_df.iterrows():
+            market = row["market"]
+            month  = int(row["month"])
+            if market not in seasonality_lookup:
+                seasonality_lookup[market] = {}
+            seasonality_lookup[market][month] = {
+                "revenue_index":   row.get("revenue_index",   1.0),
+                "occupancy_index": row.get("occupancy_index", 1.0),
+                "rate_index":      row.get("rate_index",      1.0),
+            }
+
+    return summary_lookup, seasonality_lookup
+
+
+def get_market_revenue(market_key, bedrooms, summary_lookup):
+    """
+    Get real ADR, occupancy, and monthly revenue from AirROI data.
+    Falls back to nearest bedroom count if exact match not found.
+    Returns dict with revenue stats, or None if no data available.
+    """
+    if summary_lookup is None:
+        return None
+
+    key = (market_key, int(bedrooms))
+    if key not in summary_lookup:
+        available_brs = [k[1] for k in summary_lookup if k[0] == market_key]
+        if not available_brs:
+            return None
+        nearest_br = min(available_brs, key=lambda x: abs(x - bedrooms))
+        key = (market_key, nearest_br)
+
+    data = summary_lookup[key]
+    return data if data["median_adr"] is not None else None
+
+
+# Load at module level — available to all functions
+_SUMMARY_LOOKUP, _SEASONALITY_LOOKUP = load_market_data()
+_DATA_SOURCE = "AirROI market data" if _SUMMARY_LOOKUP else "hardcoded estimates"
 
 # ── Market configs ────────────────────────────────────────────────────────────
 # ADR and occupancy are placeholders until Phase 2 pulls real AirDNA data.
@@ -208,8 +291,31 @@ def analyze_deal(
     # ══════════════════════════════════════════════════════════════════════
     else:  # STR
         # ── STR Revenue ──────────────────────────────────────────────────
-        adr       = custom_adr or market["avg_adr"]
-        occupancy = custom_occupancy or market["avg_occupancy"]
+        # Pull real market data from AirROI if available
+        br_num    = int(property_type.replace("br","").replace("studio","0").replace("4br_plus","4")) if property_type != "studio" else 0
+        real_data = get_market_revenue(market_key, br_num, _SUMMARY_LOOKUP)
+
+        if real_data and custom_adr is None:
+            adr      = real_data["median_adr"]
+            data_src = "AirROI median"
+        else:
+            adr      = custom_adr or market["avg_adr"]
+            data_src = "actual" if custom_adr else "hardcoded estimate"
+
+        if real_data and custom_occupancy is None:
+            occupancy = real_data["median_occupancy"]
+        else:
+            occupancy = custom_occupancy or market["avg_occupancy"]
+
+        # Confidence interval from AirROI p25/p75
+        if real_data:
+            monthly_ci_low  = real_data.get("p25_monthly") or real_data.get("p25_revenue", 0) / 12
+            monthly_ci_high = real_data.get("p75_monthly") or real_data.get("p75_revenue", 0) / 12
+            sample_size     = int(real_data.get("sample_size", 0))
+        else:
+            monthly_ci_low  = None
+            monthly_ci_high = None
+            sample_size     = 0
 
         if market_key == "los_angeles":
             occupied_nights = min(365 * occupancy, 120)
@@ -245,9 +351,9 @@ def analyze_deal(
         gross_yield = (gross_revenue / purchase_price) * 100
         break_even  = (total_expenses + annual_debt) / (adr * 365 * (1 - market["transient_occupancy_tax"])) * 100
 
-        # ── STR Output ───────────────────────────────────────────────────
         print(f"\n{'═' * 52}")
         print(f"  {market['label']}  |  ${purchase_price:,.0f}  |  STR  |  {property_type}")
+        print(f"  Revenue data: {data_src}" + (f" ({sample_size} comps)" if sample_size else ""))
         print(f"{'═' * 52}")
 
         print(f"\n  DEAL INPUTS")
@@ -261,11 +367,13 @@ def analyze_deal(
 
         print(f"\n  REVENUE (annual)")
         print(f"  {divider}")
-        print(f"  ADR                 ${adr:>12,.0f}/night")
+        print(f"  ADR                 ${adr:>12,.0f}/night  ({data_src})")
         print(f"  Occupancy           {occupancy*100:>11.0f}%  ({occupied_nights:.0f} nights)")
         print(f"  Gross revenue       ${gross_revenue:>12,.0f}")
         print(f"  TOT paid to city   -${tot:>12,.0f}  ({market['transient_occupancy_tax']*100:.1f}%)")
         print(f"  Net revenue         ${net_revenue:>12,.0f}")
+        if monthly_ci_low and monthly_ci_high:
+            print(f"  Monthly rev range   ${monthly_ci_low:>5,.0f} — ${monthly_ci_high:,.0f}/mo  (p25–p75)")
 
         print(f"\n  EXPENSES (annual)")
         print(f"  {divider}")
@@ -416,24 +524,27 @@ def str_vs_ltr(market_key, purchase_price, property_type="2br",
 
 if __name__ == "__main__":
 
-    # 1. STR analysis
+    print(f"\n  Using: {_DATA_SOURCE}\n")
+
+    # 1. STR analysis — uses real AirROI median ADR + occupancy
+    # property_type must match bedroom count for correct market data lookup
+    # To use ML model prediction: pass custom_adr and custom_occupancy from revenue_model.py
+    # Example:
+    #   from revenue_model import predict_revenue
+    #   pred = predict_revenue("indianapolis", bedrooms=2, ...)
+    #   analyze_deal("indianapolis", ..., custom_adr=pred["implied_adr"],
+    #                custom_occupancy=pred["implied_occupancy"])
     analyze_deal("indianapolis", purchase_price=320_000, property_type="2br", rental_type="str")
-    analyze_deal("las_vegas",    purchase_price=420_000, property_type="2br", rental_type="str")
+    analyze_deal("las_vegas",    purchase_price=420_000, property_type="3br", rental_type="str")
+    analyze_deal("los_angeles",  purchase_price=750_000, property_type="2br", rental_type="str")
 
     # 2. LTR analysis
     analyze_deal("indianapolis", purchase_price=320_000, property_type="2br", rental_type="ltr")
-    analyze_deal("las_vegas",    purchase_price=420_000, property_type="2br", rental_type="ltr")
+    analyze_deal("las_vegas",    purchase_price=420_000, property_type="3br", rental_type="ltr")
 
-    # 3. STR vs LTR side by side — most useful output
+    # 3. STR vs LTR side by side
     str_vs_ltr("indianapolis", purchase_price=320_000, property_type="2br")
-    str_vs_ltr("las_vegas",    purchase_price=420_000, property_type="2br")
+    str_vs_ltr("las_vegas",    purchase_price=420_000, property_type="3br")
 
-    # 4. With real numbers when you have them
-    # str_vs_ltr("indianapolis", purchase_price=320_000, property_type="2br",
-    #            monthly_rent=1450, custom_adr=155, custom_occupancy=0.70)
-
-    # 5. Compare all markets STR
-    compare_markets(purchase_price=400_000, down_pct=0.20, annual_rate=0.0725)
-
-    # 6. Scenario grid
+    # 4. Scenario grid
     scenario_grid("indianapolis", purchase_price=320_000)
