@@ -119,6 +119,26 @@ CATEGORICAL_FEATURES = ["market"]
 # Model target — monthly revenue ratio
 TARGET = "monthly_revenue"
 
+# ── Regulatory config ─────────────────────────────────────────────────────────
+
+STR_REGULATIONS = {
+    "los_angeles":      {"cap_nights": 120, "permit_required": 1, "owner_occupancy": 1},
+    "san_francisco":    {"cap_nights": 90,  "permit_required": 1, "owner_occupancy": 1},
+    "seattle":          {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "portland":         {"cap_nights": None,"permit_required": 1, "owner_occupancy": 1},
+    "washington":       {"cap_nights": 90,  "permit_required": 1, "owner_occupancy": 1},
+    "austin":           {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "indianapolis":     {"cap_nights": None,"permit_required": 0, "owner_occupancy": 0},
+    "las_vegas":        {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "miami":            {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "houston":          {"cap_nights": None,"permit_required": 0, "owner_occupancy": 0},
+    "anaheim":          {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "kissimmee":        {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "san_diego":        {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "south_lake_tahoe": {"cap_nights": None,"permit_required": 1, "owner_occupancy": 0},
+    "four_corners":     {"cap_nights": None,"permit_required": 0, "owner_occupancy": 0},
+}
+
 # ── Load and prepare data ─────────────────────────────────────────────────────
 
 def load_training_data():
