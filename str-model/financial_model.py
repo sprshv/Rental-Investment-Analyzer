@@ -4,11 +4,73 @@ Supports: Short-Term Rental (STR) and Long-Term Rental (LTR)
 Markets: Indianapolis, Los Angeles, Las Vegas
 Revenue data: AirROI market summary (Phase 2)
               Plug in ML model prediction via custom_adr/custom_occupancy (future)
+Interest rates: Live 30-year fixed rate from FRED API (MORTGAGE30US series)
 Usage: python financial_model.py
 """
 
 import os
+import json
+import urllib.request
+import urllib.error
 import pandas as pd
+
+# ── FRED live rate ────────────────────────────────────────────────────────────
+
+_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+
+def _load_env(path):
+    """Minimal .env loader — no external dependency needed."""
+    env = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return env
+
+
+_FALLBACK_RATE = 0.0725   # used when FRED is unreachable
+
+
+def get_live_mortgage_rate():
+    """
+    Fetch the latest weekly 30-year fixed mortgage rate from FRED (MORTGAGE30US).
+    Returns (rate_decimal, date_str, source_label).
+    Falls back to _FALLBACK_RATE on any error.
+    """
+    env = _load_env(_ENV_PATH)
+    api_key = env.get("FRED_API_KEY") or os.environ.get("FRED_API_KEY", "")
+
+    if not api_key:
+        return _FALLBACK_RATE, None, "hardcoded fallback (no API key)"
+
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id=MORTGAGE30US&api_key={api_key}"
+        "&sort_order=desc&limit=1&file_type=json"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rental-analyzer/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        obs   = data["observations"][0]
+        value = obs["value"]
+        date  = obs["date"]
+        if value == ".":
+            raise ValueError("FRED returned missing value")
+        rate  = float(value) / 100
+        return rate, date, f"FRED MORTGAGE30US ({date})"
+    except (urllib.error.URLError, KeyError, IndexError, ValueError, OSError):
+        return _FALLBACK_RATE, None, f"hardcoded fallback ({_FALLBACK_RATE*100:.2f}%)"
+
+
+# Fetch once at module load; all functions share the same rate
+_LIVE_RATE, _RATE_DATE, _RATE_SOURCE = get_live_mortgage_rate()
+
 
 # ── Market data loader ────────────────────────────────────────────────────────
 # Loads real ADR, occupancy, and monthly revenue from AirROI processed data.
@@ -173,7 +235,7 @@ def analyze_deal(
     market_key,
     purchase_price,
     down_pct=0.20,
-    annual_rate=0.0725,
+    annual_rate=None,
     closing_cost_pct=0.03,
     renovation=0,
     hoa_monthly=0,
@@ -192,8 +254,10 @@ def analyze_deal(
     override_maintenance=None,     # $ annual
     override_utilities=None,       # $ annual
 ):
-    market  = MARKETS[market_key]
-    profile = PROPERTY_TYPES.get(property_type, PROPERTY_TYPES["2br"])
+    market      = MARKETS[market_key]
+    profile     = PROPERTY_TYPES.get(property_type, PROPERTY_TYPES["2br"])
+    annual_rate = annual_rate if annual_rate is not None else _LIVE_RATE
+    rate_src    = "(live)" if annual_rate == _LIVE_RATE else "(manual)"
 
     down_payment   = purchase_price * down_pct
     closing_costs  = purchase_price * closing_cost_pct
@@ -240,7 +304,7 @@ def analyze_deal(
         print(f"  {divider}")
         print(f"  Purchase price      ${purchase_price:>12,.0f}")
         print(f"  Down payment        {down_pct*100:>11.0f}%  (${down_payment:,.0f})")
-        print(f"  Interest rate       {annual_rate*100:>11.2f}%")
+        print(f"  Interest rate       {annual_rate*100:>11.2f}%  {rate_src}")
         print(f"  Closing costs       ${closing_cost_pct*100:>10.0f}%  (${closing_costs:,.0f})")
         print(f"  Renovation          ${renovation:>12,.0f}")
         print(f"  Total cash in       ${total_invested:>12,.0f}")
@@ -360,7 +424,7 @@ def analyze_deal(
         print(f"  {divider}")
         print(f"  Purchase price      ${purchase_price:>12,.0f}")
         print(f"  Down payment        {down_pct*100:>11.0f}%  (${down_payment:,.0f})")
-        print(f"  Interest rate       {annual_rate*100:>11.2f}%")
+        print(f"  Interest rate       {annual_rate*100:>11.2f}%  {rate_src}")
         print(f"  Closing costs       ${closing_cost_pct*100:>10.0f}%  (${closing_costs:,.0f})")
         print(f"  Renovation          ${renovation:>12,.0f}")
         print(f"  Total cash in       ${total_invested:>12,.0f}")
@@ -421,10 +485,11 @@ def analyze_deal(
         }
 
 
-def compare_markets(purchase_price, down_pct=0.20, annual_rate=0.0725):
+def compare_markets(purchase_price, down_pct=0.20, annual_rate=None):
     """Run the same deal across all three markets side by side."""
+    annual_rate = annual_rate if annual_rate is not None else _LIVE_RATE
     print(f"\n{'═'*60}")
-    print(f"  MARKET COMPARISON  |  ${purchase_price:,.0f}  |  {down_pct*100:.0f}% down  |  {annual_rate*100:.2f}% rate")
+    print(f"  MARKET COMPARISON  |  ${purchase_price:,.0f}  |  {down_pct*100:.0f}% down  |  {annual_rate*100:.2f}% rate  ({_RATE_SOURCE})")
     print(f"{'═'*60}")
     print(f"  {'Metric':<28} {'Indy':>8} {'LA':>10} {'Vegas':>10}")
     print(f"  {'─'*56}")
@@ -459,9 +524,12 @@ def scenario_grid(market_key, purchase_price):
     """Show cash flow across different rate + down payment combos."""
     market = MARKETS[market_key]
     print(f"\n  SCENARIO GRID — {market['label']} — ${purchase_price:,.0f}")
+    print(f"  Rate anchor: {_LIVE_RATE*100:.2f}%  ({_RATE_SOURCE})")
     print(f"  Monthly cash flow by interest rate + down payment\n")
 
-    rates    = [0.0625, 0.0675, 0.0725, 0.0775, 0.0825]
+    # Center the 5-step range on the live rate, spaced 0.50% apart
+    base      = round(_LIVE_RATE * 200) / 200   # round to nearest 0.5%
+    rates     = [round(base - 0.01 + i * 0.005, 4) for i in range(5)]
     down_pcts = [0.10, 0.15, 0.20, 0.25]
 
     header = f"  {'Rate':<8}" + "".join(f"  {int(d*100)}% down" for d in down_pcts)
@@ -480,9 +548,10 @@ def scenario_grid(market_key, purchase_price):
 
 
 def str_vs_ltr(market_key, purchase_price, property_type="2br",
-               down_pct=0.20, annual_rate=0.0725, monthly_rent=None,
+               down_pct=0.20, annual_rate=None, monthly_rent=None,
                custom_adr=None, custom_occupancy=None):
     """Compare STR and LTR side by side for the same property."""
+    annual_rate = annual_rate if annual_rate is not None else _LIVE_RATE
     market = MARKETS[market_key]
     str_r  = analyze_deal(market_key, purchase_price, down_pct, annual_rate,
                           rental_type="str", property_type=property_type,
@@ -524,7 +593,8 @@ def str_vs_ltr(market_key, purchase_price, property_type="2br",
 
 if __name__ == "__main__":
 
-    print(f"\n  Using: {_DATA_SOURCE}\n")
+    print(f"\n  Market data:    {_DATA_SOURCE}")
+    print(f"  Mortgage rate:  {_LIVE_RATE*100:.2f}%  —  {_RATE_SOURCE}\n")
 
     # 1. STR analysis — uses real AirROI median ADR + occupancy
     # property_type must match bedroom count for correct market data lookup
