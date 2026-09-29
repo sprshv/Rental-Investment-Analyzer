@@ -1,14 +1,14 @@
 """
 Revenue Model — Phase 2
-Predicts annual STR revenue for a never-listed property using Ridge regression
-with market normalization. Trained on AirROI data across 15 markets.
+Predicts monthly STR revenue for a never-listed property.
+Trains Ridge and XGBoost, auto-selects the better performer.
 
 Key concept: model predicts revenue_ratio (how much above/below market median)
 not raw revenue. Market median anchors the dollar amount; model adjusts for
 property-specific features.
 
 Usage:
-  python revenue_model.py               ← train + evaluate
+  python revenue_model.py               ← train + evaluate both models
   python revenue_model.py --predict     ← predict for a specific property
 """
 
@@ -20,12 +20,12 @@ import argparse
 import warnings
 warnings.filterwarnings("ignore")
 
-from sklearn.linear_model import Ridge, Lasso
+from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.model_selection import cross_val_score, KFold
-from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
+from xgboost import XGBRegressor
 import pickle
 
 # ── City centers + key landmarks ──────────────────────────────────────────────
@@ -248,6 +248,13 @@ def compute_recency_factor(df):
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 
+def build_preprocessor(available_num):
+    return ColumnTransformer(transformers=[
+        ("num", StandardScaler(), available_num),
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEGORICAL_FEATURES),
+    ])
+
+
 def train_model(df):
     df = add_market_median(df)
     print(f"  After normalization: {len(df)} usable listings")
@@ -255,58 +262,101 @@ def train_model(df):
     print(f"  Monthly rev ratio median: {df['revenue_ratio'].median():.2f}")
 
     df, available_num = prepare_features(df)
-    y = df["revenue_ratio"]
-    X = df[available_num + CATEGORICAL_FEATURES]
+    y  = df["revenue_ratio"]
+    X  = df[available_num + CATEGORICAL_FEATURES]
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    # ColumnTransformer: scale numerics, one-hot encode market
-    preprocessor = ColumnTransformer(transformers=[
-        ("num", StandardScaler(), available_num),
-        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEGORICAL_FEATURES),
-    ])
-
-    pipeline = Pipeline([
-        ("preprocessor", preprocessor),
+    # ── Ridge ────────────────────────────────────────────────────────────
+    ridge_pipeline = Pipeline([
+        ("preprocessor", build_preprocessor(available_num)),
         ("ridge",        Ridge(alpha=5.0)),
     ])
-    kf     = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_mae = -cross_val_score(pipeline, X, y, cv=kf, scoring="neg_mean_absolute_error")
-    cv_r2  =  cross_val_score(pipeline, X, y, cv=kf, scoring="r2")
+    ridge_mae = -cross_val_score(ridge_pipeline, X, y, cv=kf, scoring="neg_mean_absolute_error")
+    ridge_r2  =  cross_val_score(ridge_pipeline, X, y, cv=kf, scoring="r2")
 
-    print(f"\n  Cross-validation results (5-fold):")
-    print(f"  MAE on ratio:  {cv_mae.mean():.3f} ± {cv_mae.std():.3f}")
-    print(f"  R²:            {cv_r2.mean():.3f} ± {cv_r2.std():.3f}")
-    print(f"\n  Interpreting MAE: predictions typically within ±{cv_mae.mean()*100:.0f}% of market median")
+    print(f"\n  Ridge (5-fold CV):")
+    print(f"  MAE:  {ridge_mae.mean():.3f} ± {ridge_mae.std():.3f}   R²: {ridge_r2.mean():.3f} ± {ridge_r2.std():.3f}")
 
-    # Fit on full dataset
-    pipeline.fit(X, y)
-
-    # Feature importance from Ridge coefficients
-    ridge  = pipeline.named_steps["ridge"]
-    ohe    = pipeline.named_steps["preprocessor"].named_transformers_["cat"]
+    # Feature importance from Ridge
+    ridge_pipeline.fit(X, y)
+    ohe       = ridge_pipeline.named_steps["preprocessor"].named_transformers_["cat"]
     cat_names = list(ohe.get_feature_names_out(CATEGORICAL_FEATURES))
     all_names = available_num + cat_names
-    coef_pairs = sorted(zip(all_names, ridge.coef_), key=lambda x: abs(x[1]), reverse=True)
+    coef_pairs = sorted(zip(all_names, ridge_pipeline.named_steps["ridge"].coef_),
+                        key=lambda x: abs(x[1]), reverse=True)
+    print(f"\n  Ridge feature importance (top 10):")
+    print(f"  {'Feature':<32} {'Coef':>10}")
+    print(f"  {'─'*44}")
+    for feat, coef in coef_pairs[:10]:
+        print(f"  {feat:<32} {coef:>+10.3f}  {'↑' if coef > 0 else '↓'}")
 
-    print(f"\n  Feature importance (top 12):")
-    print(f"  {'Feature':<32} {'Coefficient':>12}")
-    print(f"  {'─'*46}")
-    for feat, coef in coef_pairs[:12]:
-        direction = "↑" if coef > 0 else "↓"
-        print(f"  {feat:<32} {coef:>+10.3f}  {direction}")
+    # ── XGBoost ──────────────────────────────────────────────────────────
+    xgb_pipeline = Pipeline([
+        ("preprocessor", build_preprocessor(available_num)),
+        ("xgb", XGBRegressor(
+            n_estimators     = 300,
+            max_depth        = 3,        # shallow — prevents overfitting on small data
+            learning_rate    = 0.03,
+            subsample        = 0.8,
+            colsample_bytree = 0.8,
+            min_child_weight = 10,       # min 10 samples per leaf
+            reg_alpha        = 1.0,      # L1
+            reg_lambda       = 5.0,      # L2
+            random_state     = 42,
+            verbosity        = 0,
+            eval_metric      = "mae",
+        )),
+    ])
+    xgb_mae = -cross_val_score(xgb_pipeline, X, y, cv=kf, scoring="neg_mean_absolute_error")
+    xgb_r2  =  cross_val_score(xgb_pipeline, X, y, cv=kf, scoring="r2")
 
-    # Save
+    print(f"\n  XGBoost (5-fold CV):")
+    print(f"  MAE:  {xgb_mae.mean():.3f} ± {xgb_mae.std():.3f}   R²: {xgb_r2.mean():.3f} ± {xgb_r2.std():.3f}")
+
+    # XGBoost feature importance
+    xgb_pipeline.fit(X, y)
+    xgb_model  = xgb_pipeline.named_steps["xgb"]
+    importances = xgb_model.feature_importances_
+    xgb_pairs  = sorted(zip(all_names, importances), key=lambda x: x[1], reverse=True)
+    print(f"\n  XGBoost feature importance (top 10):")
+    print(f"  {'Feature':<32} {'Importance':>10}")
+    print(f"  {'─'*44}")
+    for feat, imp in xgb_pairs[:10]:
+        bar = "█" * int(imp * 50)
+        print(f"  {feat:<32} {imp:>10.3f}  {bar}")
+
+    # ── Auto-select winner ────────────────────────────────────────────────
+    print(f"\n  {'─'*44}")
+    if xgb_r2.mean() > ridge_r2.mean():
+        winner      = "XGBoost"
+        best_pipeline = xgb_pipeline
+        best_mae    = xgb_mae.mean()
+        best_r2     = xgb_r2.mean()
+    else:
+        winner      = "Ridge"
+        best_pipeline = ridge_pipeline
+        best_mae    = ridge_mae.mean()
+        best_r2     = ridge_r2.mean()
+
+    print(f"  Winner: {winner}  (R²: {best_r2:.3f}, MAE: {best_mae:.3f})")
+    print(f"  Predictions within ±{best_mae*100:.0f}% of market median")
+
+    # ── Save winner ───────────────────────────────────────────────────────
     model_data = {
-        "pipeline":          pipeline,
+        "pipeline":          best_pipeline,
+        "model_type":        winner.lower(),
         "numeric_features":  available_num,
         "cat_features":      CATEGORICAL_FEATURES,
         "all_feature_names": all_names,
         "markets":           df["market"].unique().tolist(),
+        "cv_r2":             round(best_r2, 3),
+        "cv_mae":            round(best_mae, 3),
     }
     with open(os.path.join(MODEL_DIR, "revenue_model.pkl"), "wb") as f:
         pickle.dump(model_data, f)
-    print(f"\n  ✓ Model saved → data/models/revenue_model.pkl")
+    print(f"\n  ✓ {winner} model saved → data/models/revenue_model.pkl")
 
-    return pipeline, available_num, df
+    return best_pipeline, available_num, df
 
 
 # ── Market summary loader ─────────────────────────────────────────────────────
@@ -383,6 +433,9 @@ def predict_revenue(
     pipeline         = model_data["pipeline"]
     numeric_features = model_data["numeric_features"]
     cat_features     = model_data["cat_features"]
+    model_type       = model_data.get("model_type", "unknown")
+    cv_r2            = model_data.get("cv_r2", "N/A")
+    cv_mae           = model_data.get("cv_mae", "N/A")
 
     market_summary = load_market_summary()
     seasonality    = load_seasonality()
@@ -465,6 +518,7 @@ def predict_revenue(
 
     print(f"\n{'═'*52}")
     print(f"  REVENUE PREDICTION  |  {market_label}")
+    print(f"  Model: {model_type.upper()}  (CV R²: {cv_r2}, MAE: ±{int(float(cv_mae)*100) if cv_mae != 'N/A' else '?'}%)")
     print(f"{'═'*52}")
     print(f"\n  PROPERTY")
     print(f"  {divider}")
